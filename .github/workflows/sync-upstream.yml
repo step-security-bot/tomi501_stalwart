@@ -1,0 +1,175 @@
+name: Sync upstream and apply fork customisations
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 * * *'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout fork with full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Add upstream remote and fetch
+        run: |
+          git remote add upstream https://github.com/stalwartlabs/stalwart.git
+          git fetch upstream
+          git fetch origin
+
+      - name: Determine old and new upstream SHAs
+        id: get_shas
+        run: |
+          NEW_SHA=$(git rev-parse upstream/main)
+          if git rev-parse --verify origin/customized >/dev/null 2>&1; then
+            OLD_SHA=$(git rev-parse origin/customized~1)
+          else
+            OLD_SHA=$(git rev-list --max-parents=0 upstream/main)
+          fi
+          echo "old_sha=$OLD_SHA" >> $GITHUB_OUTPUT
+          echo "new_sha=$NEW_SHA" >> $GITHUB_OUTPUT
+
+      - name: Exit early if no new upstream commits
+        if: steps.get_shas.outputs.old_sha == steps.get_shas.outputs.new_sha
+        run: |
+          echo "No new upstream commits since last sync. Exiting."
+          exit 0
+
+      - name: Build commit message
+        id: commit_msg
+        run: |
+          OLD_SHA="${{ steps.get_shas.outputs.old_sha }}"
+          NEW_SHA="${{ steps.get_shas.outputs.new_sha }}"
+          OLD_SHORT=$(git rev-parse --short $OLD_SHA)
+          NEW_SHORT=$(git rev-parse --short $NEW_SHA)
+          MSG="chore: sync to upstream/main ($OLD_SHORT..$NEW_SHORT)"
+          echo "msg=$MSG" >> $GITHUB_OUTPUT
+
+      - name: Update main via fast-forward (preserves the sync workflow file)
+        run: |
+          git checkout main
+          git merge --ff-only upstream/main
+
+      - name: Reset customized branch to upstream/main (discard old custom commit)
+        run: |
+          git branch -D customized || true
+          git checkout -b customized upstream/main
+
+      - name: Apply custom GitHub Actions workflows from fork/actions
+        run: |
+          git fetch origin fork/actions || true
+          git checkout fork/actions -- .github/workflows/ 2>/dev/null || echo "No .github/workflows/ in fork/actions, skipping."
+          git add .github/workflows/
+
+      - name: Replace public key in license.rs
+        env:
+          NEW_KEY: ${{ vars.NEW_PUBLIC_KEY_BYTES }}
+        run: |
+          python3 << 'EOF'
+          import os, re
+
+          FILE_PATH = 'crates/common/src/enterprise/license.rs'
+          NEW_BYTES_RAW = os.environ['NEW_KEY'].strip()
+
+          if not NEW_BYTES_RAW:
+              print('❌ NEW_PUBLIC_KEY_BYTES variable is empty')
+              exit(1)
+
+          new_numbers = [x.strip() for x in NEW_BYTES_RAW.split(',') if x.strip()]
+          if len(new_numbers) != 32:
+              print(f'❌ Expected 32 numbers, got {len(new_numbers)}')
+              exit(1)
+
+          with open(FILE_PATH, 'r') as f:
+              lines = f.readlines()
+
+          start_idx = None
+          for i, line in enumerate(lines):
+              if 'public_key:' in line and 'UnparsedPublicKey::new' in line:
+                  for j in range(i, len(lines)):
+                      if 'vec![' in lines[j]:
+                          start_idx = j
+                          break
+                  break
+
+          if start_idx is None:
+              print('❌ Could not find vec![ block for the public key')
+              exit(1)
+
+          end_idx = None
+          for j in range(start_idx, len(lines)):
+              if '],' in lines[j] and 'vec![' not in lines[j]:
+                  end_idx = j
+                  break
+
+          if end_idx is None:
+              print('❌ Could not find closing "]," for the vec! block')
+              exit(1)
+
+          vec_line = lines[start_idx]
+          vec_indent = vec_line[:len(vec_line) - len(vec_line.lstrip())]
+
+          elem_indent = None
+          for j in range(start_idx + 1, end_idx):
+              if lines[j].strip() and any(c.isdigit() for c in lines[j]):
+                  elem_indent = lines[j][:len(lines[j]) - len(lines[j].lstrip())]
+                  break
+
+          if elem_indent is None:
+              elem_indent = vec_indent + '    '
+
+          chunk_size = 16
+          formatted_lines = []
+          for i in range(0, len(new_numbers), chunk_size):
+              chunk = new_numbers[i:i+chunk_size]
+              line = elem_indent + ', '.join(chunk) + ','
+              formatted_lines.append(line)
+
+          new_block = []
+          new_block.append(vec_indent + 'vec![')
+          new_block.extend(formatted_lines)
+          new_block.append(vec_indent + '],')
+
+          new_lines = lines[:start_idx] + [line + '\n' for line in new_block] + lines[end_idx+1:]
+
+          with open(FILE_PATH, 'w') as f:
+              f.writelines(new_lines)
+
+          print('✅ Public key replaced successfully')
+          EOF
+
+          git add crates/common/src/enterprise/license.rs
+
+      - name: Commit changes on customized branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit – skipping commit."
+            echo "NO_CHANGES=true" >> $GITHUB_ENV
+          else
+            COMMIT_MSG="${{ steps.commit_msg.outputs.msg }}"
+            git commit -m "$COMMIT_MSG"
+            echo "✅ Commit created: $COMMIT_MSG"
+            echo "COMMIT_CREATED=true" >> $GITHUB_ENV
+          fi
+
+      - name: Push main (always) and customized (only if committed)
+        run: |
+          git push origin main
+          echo "✅ main pushed"
+
+          if [ "$COMMIT_CREATED" = "true" ]; then
+            git push --force-with-lease origin customized
+            echo "✅ customized pushed"
+          else
+            echo "Skipping customized push – no new commit was created."
+          fi
